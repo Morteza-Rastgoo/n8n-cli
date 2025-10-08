@@ -1,0 +1,1729 @@
+#!/bin/bash
+
+# ===================================================================
+# n8n Advanced CLI Tool
+# Comprehensive workflow management for n8n instances
+# ===================================================================
+
+set -e
+
+# Load environment configuration with proper precedence
+load_env() {
+    local env_file="${1:-.env}"
+    
+    if [[ -f "$env_file" ]]; then
+        # Read .env file line by line and only set if not already set
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ -z "$key" ]] && continue
+            
+            # Remove quotes from value
+            value=$(echo "$value" | sed 's/^[\"'"'"']//; s/[\"'"'"']$//')
+            
+            # Only set if not already set (environment variables take precedence)
+            if [[ -z "${!key}" ]]; then
+                export "$key"="$value"
+            fi
+        done < "$env_file"
+        echo "✓ Loaded configuration from $env_file" >&2
+    else
+        echo "⚠ Configuration file $env_file not found, using defaults" >&2
+    fi
+}
+
+# Load configuration
+load_env
+
+# Configuration with defaults
+N8N_URL="${N8N_URL:-https://n8n.com}"
+N8N_API_KEY="${N8N_API_KEY:-}"
+DEFAULT_BACKUP_DIR="${DEFAULT_BACKUP_DIR:-./backups}"
+DEFAULT_EXECUTION_LIMIT="${DEFAULT_EXECUTION_LIMIT:-20}"
+DEFAULT_BENCHMARK_ITERATIONS="${DEFAULT_BENCHMARK_ITERATIONS:-5}"
+ENABLE_DEBUG="${ENABLE_DEBUG:-false}"
+ENABLE_COLORS="${ENABLE_COLORS:-true}"
+API_TIMEOUT="${API_TIMEOUT:-30}"
+API_MAX_RETRIES="${API_MAX_RETRIES:-3}"
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors for output (configurable)
+if [[ "$ENABLE_COLORS" == "true" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    PURPLE='\033[0;35m'
+    CYAN='\033[0;36m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    PURPLE=''
+    CYAN=''
+    NC=''
+fi
+
+# Utility functions
+log() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
+debug() { [[ "$ENABLE_DEBUG" == "true" ]] && echo -e "${CYAN}[DEBUG]${NC} $1"; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+
+# Enhanced configuration validation
+validate_config() {
+    local errors=0
+    
+    if [[ -z "$N8N_API_KEY" ]]; then
+        error "N8N_API_KEY not set. Please check your .env file or environment variables."
+        ((errors++))
+    fi
+    
+    if [[ -z "$N8N_URL" ]]; then
+        error "N8N_URL not set. Please check your .env file or environment variables."
+        ((errors++))
+    fi
+    
+    # Validate URL format
+    if [[ -n "$N8N_URL" && ! "$N8N_URL" =~ ^https?:// ]]; then
+        error "N8N_URL must start with http:// or https://"
+        ((errors++))
+    fi
+    
+    # Validate API key format (should be base64-like)
+    if [[ -n "$N8N_API_KEY" && ${#N8N_API_KEY} -lt 20 ]]; then
+        warn "N8N_API_KEY seems too short, please verify it's correct"
+    fi
+    
+    if [[ $errors -gt 0 ]]; then
+        return 1
+    fi
+    
+    debug "Configuration validated: URL=$N8N_URL"
+    return 0
+}
+
+# Enhanced API request function with better error handling and debugging
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local data="$3"
+    local extra_headers="$4"
+    local max_retries="${API_MAX_RETRIES:-3}"
+    local retry_count=0
+    
+    # Validate required parameters
+    if [[ -z "$N8N_URL" || -z "$N8N_API_KEY" ]]; then
+        error "Configuration not properly loaded. Run validate_config first."
+        return 1
+    fi
+    
+    local url="${N8N_URL}/api/v1${endpoint}"
+    
+    debug "API Request: $method $url"
+    [[ -n "$data" ]] && debug "Request data: ${data:0:200}$([ ${#data} -gt 200 ] && echo "...")"
+    
+    while [[ $retry_count -lt $max_retries ]]; do
+        local response
+        local http_code
+        local curl_exit_code
+        
+        if [[ "$method" == "GET" ]]; then
+            response=$(curl -s -w "\\n%{http_code}" -X GET "$url" \
+                -H "X-N8N-API-KEY: $N8N_API_KEY" \
+                -H "Content-Type: application/json" \
+                --max-time "${API_TIMEOUT:-30}" \
+                $extra_headers 2>/dev/null)
+            curl_exit_code=$?
+        else
+            response=$(curl -s -w "\\n%{http_code}" -X "$method" "$url" \
+                -H "X-N8N-API-KEY: $N8N_API_KEY" \
+                -H "Content-Type: application/json" \
+                --max-time "${API_TIMEOUT:-30}" \
+                $extra_headers \
+                -d "$data" 2>/dev/null)
+            curl_exit_code=$?
+        fi
+        
+        # Handle curl errors
+        if [[ $curl_exit_code -ne 0 ]]; then
+            warn "Network error (curl exit code: $curl_exit_code), retrying..."
+            ((retry_count++))
+            sleep $((retry_count))
+            continue
+        fi
+        
+        # Extract HTTP status code (last line)
+        if [[ -n "$response" ]]; then
+            http_code=$(echo "$response" | tail -n1)
+            response=$(echo "$response" | sed '$d')  # Remove last line
+        else
+            http_code="000"
+            response=""
+        fi
+        
+        debug "HTTP Status: $http_code"
+        [[ "$ENABLE_DEBUG" == "true" && -n "$response" ]] && debug "Response: ${response:0:200}$([ ${#response} -gt 200 ] && echo "...")"
+        
+        # Check for successful response
+        if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            echo "$response"
+            return 0
+        elif [[ "$http_code" == "401" ]]; then
+            error "Authentication failed. Please check your API key."
+            echo "$response"
+            return 1
+        elif [[ "$http_code" == "404" ]]; then
+            error "Resource not found (404)"
+            echo "$response"
+            return 1
+        elif [[ "$http_code" == "429" ]]; then
+            # Rate limited, wait and retry
+            warn "Rate limited (429), retrying in $((retry_count + 2)) seconds..."
+            sleep $((retry_count + 2))
+        elif [[ "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+            # Server error, retry
+            warn "Server error ($http_code), retrying in $((retry_count + 1)) seconds..."
+            sleep $((retry_count + 1))
+        else
+            # Client error or other, don't retry
+            error "Request failed with HTTP $http_code"
+            echo "$response"
+            return 1
+        fi
+        
+        ((retry_count++))
+    done
+    
+    error "Request failed after $max_retries retries"
+    echo "$response"
+    return 1
+}
+
+# ===================================================================
+# WORKFLOW MANAGEMENT FUNCTIONS
+# ===================================================================
+
+# List all workflows
+list_workflows() {
+    log "Fetching workflows from $N8N_URL..."
+    
+    local response=$(api_request "GET" "/workflows")
+    
+    # Check if we got a valid JSON response with data
+    if ! echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        error "Failed to fetch workflows: $response"
+        return 1
+    fi
+    
+    echo "$response" | jq -r '.data[] | "\(.id) | \(.name) | \(.active) | \(.updatedAt)"' | column -t -s '|'
+    
+    local count=$(echo "$response" | jq '.data | length')
+    success "Found $count workflows"
+}
+
+# Get workflow by ID or name
+get_workflow() {
+    local identifier="$1"
+    
+    if [[ -z "$identifier" ]]; then
+        error "Workflow ID or name required"
+        return 1
+    fi
+    
+    # Parse URL if provided (extract workflow ID from URL like https://n8n.com/workflow/QFErgCBsHyJn9glG/executions/184843)
+    if [[ "$identifier" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        identifier="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $identifier"
+    fi
+    
+    log "Fetching workflow: $identifier"
+    
+    # Try by ID first (n8n IDs are alphanumeric, not just numeric)
+    if [[ "$identifier" =~ ^[a-zA-Z0-9]+$ ]]; then
+        local response=$(api_request "GET" "/workflows/$identifier")
+        
+        # Check if we got a valid response (direct workflow response doesn't have .data wrapper)
+        if echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+            echo "$response" | jq .
+            return 0
+        fi
+    fi
+    
+    # If ID lookup failed, search by name
+    local all_workflows=$(api_request "GET" "/workflows")
+    local workflow_id=$(echo "$all_workflows" | jq -r ".data[] | select(.name == \"$identifier\") | .id")
+    
+    if [[ -z "$workflow_id" ]]; then
+        error "Workflow '$identifier' not found"
+        return 1
+    fi
+    
+    local response=$(api_request "GET" "/workflows/$workflow_id")
+    
+    # Check if we got a valid JSON response
+    if ! echo "$response" | jq -e '.' >/dev/null 2>&1; then
+        error "Failed to fetch workflow: $response"
+        return 1
+    fi
+    
+    echo "$response" | jq .
+}
+
+# Create workflow
+create_workflow() {
+    local workflow_file="$1"
+    
+    if [[ -z "$workflow_file" ]]; then
+        error "Workflow JSON file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$workflow_file" ]]; then
+        error "File not found: $workflow_file"
+        return 1
+    fi
+    
+    log "Creating workflow from: $workflow_file"
+    
+    local workflow_data=$(cat "$workflow_file")
+    local response=$(api_request "POST" "/workflows" "$workflow_data")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to create workflow: $response"
+        return 1
+    fi
+    
+    local workflow_id=$(echo "$response" | jq -r '.data.id')
+    local workflow_name=$(echo "$response" | jq -r '.data.name')
+    
+    success "Created workflow: $workflow_name (ID: $workflow_id)"
+    echo "$response" | jq .
+}
+
+# Update workflow
+update_workflow() {
+    local identifier="$1"
+    local workflow_file="$2"
+    
+    if [[ -z "$identifier" || -z "$workflow_file" ]]; then
+        error "Workflow ID/name and JSON file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$workflow_file" ]]; then
+        error "File not found: $workflow_file"
+        return 1
+    fi
+    
+    log "Updating workflow: $identifier"
+    
+    # Parse URL if provided
+    if [[ "$identifier" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        identifier="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $identifier"
+    fi
+    
+    # Get workflow ID if name provided (only search by name if not alphanumeric)
+    if [[ ! "$identifier" =~ ^[a-zA-Z0-9]+$ ]]; then
+        local all_workflows=$(api_request "GET" "/workflows")
+        identifier=$(echo "$all_workflows" | jq -r ".data[] | select(.name == \"$identifier\") | .id")
+        
+        if [[ -z "$identifier" ]]; then
+            error "Workflow not found"
+            return 1
+        fi
+    fi
+    
+    local workflow_data=$(cat "$workflow_file")
+    local response=$(api_request "PUT" "/workflows/$identifier" "$workflow_data")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to update workflow: $response"
+        return 1
+    fi
+    
+    success "Updated workflow: $identifier"
+    echo "$response" | jq .
+}
+
+# Delete workflow
+delete_workflow() {
+    local identifier="$1"
+    
+    if [[ -z "$identifier" ]]; then
+        error "Workflow ID or name required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$identifier" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        identifier="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $identifier"
+    fi
+    
+    # Get workflow ID if name provided (only search by name if not alphanumeric)
+    if [[ ! "$identifier" =~ ^[a-zA-Z0-9]+$ ]]; then
+        local all_workflows=$(api_request "GET" "/workflows")
+        local workflow_name="$identifier"
+        identifier=$(echo "$all_workflows" | jq -r ".data[] | select(.name == \"$workflow_name\") | .id")
+        
+        if [[ -z "$identifier" ]]; then
+            error "Workflow '$workflow_name' not found"
+            return 1
+        fi
+    fi
+    
+    warn "Are you sure you want to delete workflow ID $identifier? (y/N)"
+    read -r confirmation
+    
+    if [[ "$confirmation" != "y" && "$confirmation" != "Y" ]]; then
+        log "Deletion cancelled"
+        return 0
+    fi
+    
+    log "Deleting workflow: $identifier"
+    
+    local response=$(api_request "DELETE" "/workflows/$identifier")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to delete workflow: $response"
+        return 1
+    fi
+    
+    success "Deleted workflow: $identifier"
+}
+
+# Activate/Deactivate workflow
+toggle_workflow() {
+    local identifier="$1"
+    local action="$2"  # activate or deactivate
+    
+    if [[ -z "$identifier" || -z "$action" ]]; then
+        error "Workflow ID/name and action (activate/deactivate) required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$identifier" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        identifier="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $identifier"
+    fi
+    
+    # Get workflow ID if name provided (only search by name if not alphanumeric)
+    if [[ ! "$identifier" =~ ^[a-zA-Z0-9]+$ ]]; then
+        local all_workflows=$(api_request "GET" "/workflows")
+        identifier=$(echo "$all_workflows" | jq -r ".data[] | select(.name == \"$identifier\") | .id")
+        
+        if [[ -z "$identifier" ]]; then
+            error "Workflow not found"
+            return 1
+        fi
+    fi
+    
+    local endpoint="/workflows/$identifier"
+    if [[ "$action" == "activate" ]]; then
+        endpoint="${endpoint}/activate"
+    else
+        endpoint="${endpoint}/deactivate"
+    fi
+    
+    if [[ "$action" == "activate" ]]; then
+        log "Activating workflow: $identifier"
+    else
+        log "Deactivating workflow: $identifier"
+    fi
+    
+    local response=$(api_request "POST" "$endpoint" "{}")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to $action workflow: $response"
+        return 1
+    fi
+    
+    if [[ "$action" == "activate" ]]; then
+        success "Activated workflow: $identifier"
+    else
+        success "Deactivated workflow: $identifier"
+    fi
+}
+
+# Execute workflow
+execute_workflow() {
+    local identifier="$1"
+    local input_data="$2"
+    
+    if [[ -z "$identifier" ]]; then
+        error "Workflow ID or name required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$identifier" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        identifier="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $identifier"
+    fi
+    
+    # Get workflow ID if name provided (only search by name if not alphanumeric)
+    if [[ ! "$identifier" =~ ^[a-zA-Z0-9]+$ ]]; then
+        local all_workflows=$(api_request "GET" "/workflows")
+        identifier=$(echo "$all_workflows" | jq -r ".data[] | select(.name == \"$identifier\") | .id")
+        
+        if [[ -z "$identifier" ]]; then
+            error "Workflow not found"
+            return 1
+        fi
+    fi
+    
+    log "Executing workflow: $identifier"
+    
+    local data="${input_data:-{}}"
+    local response=$(api_request "POST" "/workflows/$identifier/execute" "$data")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to execute workflow: $response"
+        return 1
+    fi
+    
+    local execution_id=$(echo "$response" | jq -r '.data.id')
+    success "Started execution: $execution_id"
+    echo "$response" | jq .
+}
+
+# Search workflows by name or content
+search_workflows() {
+    local search_term="$1"
+    local search_type="${2:-name}"  # name, content, or both
+    
+    if [[ -z "$search_term" ]]; then
+        error "Search term required"
+        return 1
+    fi
+    
+    log "Searching workflows for: '$search_term' (type: $search_type)"
+    
+    local response=$(api_request "GET" "/workflows")
+    
+    if ! echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        error "Failed to fetch workflows: $response"
+        return 1
+    fi
+    
+    local results
+    case "$search_type" in
+        "name")
+            results=$(echo "$response" | jq -r ".data[] | select(.name | test(\"$search_term\"; \"i\")) | \"\(.id) | \(.name) | \(.active) | \(.updatedAt)\"")
+            ;;
+        "content")
+            # Search in nodes and connections (requires full workflow data)
+            results=$(echo "$response" | jq -r ".data[] | select(((.nodes // []) | tostring) + ((.connections // {}) | tostring) | test(\"$search_term\"; \"i\")) | \"\(.id) | \(.name) | \(.active) | \(.updatedAt)\"")
+            ;;
+        "both")
+            results=$(echo "$response" | jq -r ".data[] | select((.name | test(\"$search_term\"; \"i\")) or (((.nodes // []) | tostring) + ((.connections // {}) | tostring) | test(\"$search_term\"; \"i\"))) | \"\(.id) | \(.name) | \(.active) | \(.updatedAt)\"")
+            ;;
+        *)
+            error "Invalid search type. Use: name, content, or both"
+            return 1
+            ;;
+    esac
+    
+    if [[ -n "$results" ]]; then
+        echo "ID | NAME | ACTIVE | UPDATED"
+        echo "$results" | column -t -s '|'
+        local count=$(echo "$results" | wc -l | tr -d ' ')
+        success "Found $count matching workflow(s)"
+    else
+        warn "No workflows found matching '$search_term'"
+    fi
+}
+
+# ===================================================================
+# WEBHOOK MANAGEMENT FUNCTIONS
+# ===================================================================
+
+# Send webhook request
+send_webhook() {
+    local webhook_path="$1"
+    local data="$2"
+    local method="${3:-POST}"
+    
+    if [[ -z "$webhook_path" ]]; then
+        error "Webhook path required (e.g., 'ffmpeg-result' or '/webhook/ffmpeg-result')"
+        return 1
+    fi
+    
+    # Normalize webhook path - add /webhook/ prefix if not present
+    if [[ ! "$webhook_path" =~ ^/webhook/ ]]; then
+        if [[ "$webhook_path" =~ ^/ ]]; then
+            webhook_path="/webhook${webhook_path}"
+        else
+            webhook_path="/webhook/${webhook_path}"
+        fi
+    fi
+    
+    local url="${N8N_URL}${webhook_path}"
+    log "Sending $method request to webhook: $url"
+    
+    local webhook_data="${data:-{}}"
+    
+    if [[ "$method" == "GET" ]]; then
+        curl -s -X GET "$url" \
+            -H "Content-Type: application/json"
+    else
+        curl -s -X "$method" "$url" \
+            -H "Content-Type: application/json" \
+            --data-raw "$webhook_data"
+    fi
+    
+    local exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then
+        success "Webhook request sent successfully"
+    else
+        error "Webhook request failed with exit code: $exit_code"
+        return $exit_code
+    fi
+}
+
+# Test webhook connectivity with enhanced validation
+test_webhook() {
+    local webhook_path="$1"
+    
+    if [[ -z "$webhook_path" ]]; then
+        error "Webhook path required"
+        return 1
+    fi
+    
+    log "Testing webhook connectivity: $webhook_path"
+    
+    # Normalize webhook path
+    if [[ ! "$webhook_path" =~ ^/webhook/ ]]; then
+        if [[ "$webhook_path" =~ ^/ ]]; then
+            webhook_path="/webhook${webhook_path}"
+        else
+            webhook_path="/webhook/${webhook_path}"
+        fi
+    fi
+    
+    local url="${N8N_URL}${webhook_path}"
+    local test_payload='{"test":"connectivity","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+    
+    debug "Testing URL: $url"
+    debug "Test payload: $test_payload"
+    
+    local response
+    local http_code
+    
+    response=$(curl -s -w "\\n%{http_code}" -X POST "$url" \
+        -H "Content-Type: application/json" \
+        --data-raw "$test_payload" \
+        --max-time 30 2>/dev/null)
+    
+    if [[ -n "$response" ]]; then
+        http_code=$(echo "$response" | tail -n1)
+        response=$(echo "$response" | sed '$d')  # Remove last line
+    else
+        http_code="000"
+        response="No response"
+    fi
+    
+    echo "HTTP Status: $http_code"
+    echo "Response: $response"
+    
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        success "Webhook is accessible and responding"
+        return 0
+    elif [[ "$http_code" == "404" ]]; then
+        error "Webhook not found (404) - check if workflow is active"
+        return 1
+    elif [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+        error "Authentication error ($http_code)"
+        return 1
+    else
+        error "Webhook test failed with HTTP $http_code"
+        return 1
+    fi
+}
+
+# ===================================================================
+# EXECUTION MANAGEMENT FUNCTIONS
+# ===================================================================
+
+# List executions
+list_executions() {
+    local workflow_id="$1"
+    local limit="${2:-$DEFAULT_EXECUTION_LIMIT}"
+    
+    # Parse workflow ID from URL if provided
+    if [[ "$workflow_id" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        workflow_id="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $workflow_id"
+    fi
+    
+    local endpoint="/executions"
+    if [[ -n "$workflow_id" ]]; then
+        endpoint="${endpoint}?workflowId=$workflow_id&limit=$limit"
+    else
+        endpoint="${endpoint}?limit=$limit"
+    fi
+    
+    log "Fetching executions..."
+    
+    local response=$(api_request "GET" "$endpoint")
+    
+    # Check if we got valid data - the response format is correct, just contains 'data'
+    if ! echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        error "Invalid response format: $response"
+        return 1
+    fi
+    
+    # Enhanced output with better formatting
+    echo "ID | WORKFLOW | STATUS | MODE | STARTED | STOPPED"
+    echo "$response" | jq -r '.data[] | "\(.id) | \(.workflowId // "N/A") | \(.status) | \(.mode // "N/A") | \(.startedAt) | \(.stoppedAt // "Running")"' | column -t -s '|'
+    
+    local count=$(echo "$response" | jq '.data | length')
+    success "Found $count executions"
+    
+    # Show summary statistics
+    if [[ $count -gt 0 ]]; then
+        local successful=$(echo "$response" | jq '.data | map(select(.status == "success")) | length')
+        local failed=$(echo "$response" | jq '.data | map(select(.status == "error")) | length')
+        local running=$(echo "$response" | jq '.data | map(select(.status == "running")) | length')
+        
+        echo ""
+        log "Summary: ✅ $successful successful, ❌ $failed failed, 🔄 $running running"
+    fi
+}
+
+# Enhanced execution details with better formatting
+get_execution_details() {
+    local execution_id="$1"
+    local show_data="${2:-false}"
+    
+    if [[ -z "$execution_id" ]]; then
+        error "Execution ID required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$execution_id" =~ https?://[^/]+/workflow/[^/]+/executions/([^/]+) ]]; then
+        execution_id="${BASH_REMATCH[1]}"
+        log "Extracted execution ID from URL: $execution_id"
+    fi
+    
+    log "Fetching execution details: $execution_id"
+    
+    local response=$(api_request "GET" "/executions/$execution_id")
+    
+    # Check if response contains valid execution data
+    if ! echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+        error "Failed to fetch execution or invalid response: $response"
+        return 1
+    fi
+    
+    if [[ "$show_data" == "true" ]]; then
+        echo "$response" | jq .
+    else
+        # Show formatted summary
+        echo "🔍 Execution Summary"
+        echo "==================="
+        echo "$response" | jq -r '"ID: " + .id'
+        echo "$response" | jq -r '"Workflow: " + (.workflowId // "N/A")'
+        echo "$response" | jq -r '"Status: " + .status'
+        echo "$response" | jq -r '"Mode: " + (.mode // "N/A")'
+        echo "$response" | jq -r '"Started: " + .startedAt'
+        echo "$response" | jq -r '"Stopped: " + (.stoppedAt // "Still running")'
+        
+        if echo "$response" | jq -e '.status == "success"' >/dev/null; then
+            success "Execution completed successfully"
+        elif echo "$response" | jq -e '.status == "error"' >/dev/null; then
+            error "Execution failed"
+            # Show error details if available
+            if echo "$response" | jq -e '.data.resultData.error' >/dev/null 2>&1; then
+                echo "$response" | jq -r '.data.resultData.error.message // "No error message available"'
+            fi
+        else
+            log "Execution is in progress"
+        fi
+    fi
+}
+
+# ===================================================================
+# COMPREHENSIVE TESTING SUITE
+# ===================================================================
+
+# Run comprehensive tests
+run_comprehensive_tests() {
+    local test_workflow_id="${1:-VloRw01VFwENk21E}"
+    
+    echo "🧪 Running Comprehensive n8n CLI Tests"
+    echo "====================================="
+    
+    local tests_passed=0
+    local tests_failed=0
+    
+    # Test 1: API Connectivity
+    echo "
+📡 Test 1: API Connectivity"
+    if test_connection >/dev/null 2>&1; then
+        success "✅ API connectivity test passed"
+        ((tests_passed++))
+    else
+        error "❌ API connectivity test failed"
+        ((tests_failed++))
+    fi
+    
+    # Test 2: Workflow Listing
+    echo "
+📋 Test 2: Workflow Listing"
+    if list_workflows >/dev/null 2>&1; then
+        success "✅ Workflow listing test passed"
+        ((tests_passed++))
+    else
+        error "❌ Workflow listing test failed"
+        ((tests_failed++))
+    fi
+    
+    # Test 3: Workflow Details
+    echo "
+🔍 Test 3: Workflow Details"
+    if get_workflow "$test_workflow_id" >/dev/null 2>&1; then
+        success "✅ Workflow details test passed"
+        ((tests_passed++))
+    else
+        error "❌ Workflow details test failed"
+        ((tests_failed++))
+    fi
+    
+    # Test 4: Execution Listing
+    echo "
+📊 Test 4: Execution Listing"
+    if list_executions "$test_workflow_id" 3 >/dev/null 2>&1; then
+        success "✅ Execution listing test passed"
+        ((tests_passed++))
+    else
+        error "❌ Execution listing test failed"
+        ((tests_failed++))
+    fi
+    
+    # Test 5: Webhook Testing
+    echo "
+🌐 Test 5: Webhook Testing"
+    if test_webhook "ffmpeg-result" >/dev/null 2>&1; then
+        success "✅ Webhook testing passed"
+        ((tests_passed++))
+    else
+        warn "⚠️ Webhook testing failed (may be expected)"
+        ((tests_failed++))
+    fi
+    
+    # Test 6: Statistics
+    echo "
+📈 Test 6: Statistics"
+    if get_stats >/dev/null 2>&1; then
+        success "✅ Statistics test passed"
+        ((tests_passed++))
+    else
+        error "❌ Statistics test failed"
+        ((tests_failed++))
+    fi
+    
+    # Summary
+    echo "
+🎯 Test Summary"
+    echo "=============="
+    echo "✅ Passed: $tests_passed"
+    echo "❌ Failed: $tests_failed"
+    echo "📊 Success Rate: $(( tests_passed * 100 / (tests_passed + tests_failed) ))%"
+    
+    if [[ $tests_failed -eq 0 ]]; then
+        success "🎉 All tests passed!"
+        return 0
+    else
+        error "⚠️ Some tests failed"
+        return 1
+    fi
+}
+
+# Performance benchmarking
+benchmark_api() {
+    local iterations="${1:-$DEFAULT_BENCHMARK_ITERATIONS}"
+    
+    echo "⚡ API Performance Benchmark"
+    echo "==========================="
+    
+    local total_time=0
+    local successful_requests=0
+    
+    for ((i=1; i<=iterations; i++)); do
+        echo "Request $i/$iterations..."
+        local start_time=$(date +%s.%3N)
+        
+        if test_connection >/dev/null 2>&1; then
+            local end_time=$(date +%s.%3N)
+            local request_time=$(echo "$end_time - $start_time" | bc)
+            total_time=$(echo "$total_time + $request_time" | bc)
+            ((successful_requests++))
+            echo "  ✅ Response time: ${request_time}s"
+        else
+            echo "  ❌ Request failed"
+        fi
+        
+        sleep 1
+    done
+    
+    if [[ $successful_requests -gt 0 ]]; then
+        local avg_time=$(echo "scale=3; $total_time / $successful_requests" | bc)
+        echo "
+📊 Benchmark Results:"
+        echo "Successful requests: $successful_requests/$iterations"
+        echo "Average response time: ${avg_time}s"
+        echo "Success rate: $(( successful_requests * 100 / iterations ))%"
+    else
+        error "All requests failed"
+    fi
+}
+
+# ===================================================================
+# ENHANCED BACKUP AND RESTORE
+# ===================================================================
+
+# Enhanced backup with metadata and validation
+backup_workflows() {
+    local backup_dir="${1:-$DEFAULT_BACKUP_DIR}"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="$backup_dir/n8n_backup_$timestamp.json"
+    
+    mkdir -p "$backup_dir"
+    
+    log "Creating enhanced backup..."
+    
+    local response=$(api_request "GET" "/workflows")
+    
+    # Check if we got a valid JSON response with data
+    if ! echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        error "Failed to fetch workflows for backup: $response"
+        return 1
+    fi
+    
+    # Get additional metadata
+    local instance_stats=$(get_stats 2>/dev/null || echo "{}")
+    local cli_version=$(show_version | head -1)
+    
+    # Create enhanced backup structure
+    local backup_data=$(cat << EOF
+{
+    "backup_info": {
+        "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)",
+        "source": "$N8N_URL",
+        "cli_version": "$cli_version",
+        "backup_type": "full",
+        "created_by": "n8n-cli"
+    },
+    "workflows": $response,
+    "metadata": {
+        "total_workflows": $(echo "$response" | jq '.data | length'),
+        "active_workflows": $(echo "$response" | jq '.data | map(select(.active == true)) | length'),
+        "backup_size_bytes": $(echo "$response" | wc -c)
+    }
+}
+EOF
+)
+    
+    echo "$backup_data" | jq . > "$backup_file"
+    
+    local count=$(echo "$response" | jq '.data | length')
+    local file_size=$(ls -lh "$backup_file" | awk '{print $5}')
+    
+    success "Enhanced backup created: $backup_file"
+    log "Workflows backed up: $count"
+    log "Backup file size: $file_size"
+    
+    # Create backup index
+    local index_file="$backup_dir/backup_index.json"
+    local index_entry=$(cat << EOF
+{
+    "timestamp": "$timestamp",
+    "file": "$(basename "$backup_file")",
+    "workflows": $count,
+    "size": "$file_size",
+    "path": "$backup_file"
+}
+EOF
+)
+    
+    if [[ -f "$index_file" ]]; then
+        # Add to existing index
+        jq ". += [$index_entry]" "$index_file" > "${index_file}.tmp" && mv "${index_file}.tmp" "$index_file"
+    else
+        # Create new index
+        echo "[$index_entry]" | jq . > "$index_file"
+    fi
+    
+    success "Backup index updated: $index_file"
+}
+
+# List available backups
+list_backups() {
+    local backup_dir="${1:-$DEFAULT_BACKUP_DIR}"
+    
+    if [[ ! -d "$backup_dir" ]]; then
+        error "Backup directory not found: $backup_dir"
+        return 1
+    fi
+    
+    local index_file="$backup_dir/backup_index.json"
+    
+    if [[ -f "$index_file" ]]; then
+        log "Available backups from index:"
+        echo "TIMESTAMP | FILE | WORKFLOWS | SIZE"
+        jq -r '.[] | "\(.timestamp) | \(.file) | \(.workflows) | \(.size)"' "$index_file" | column -t -s '|'
+    else
+        log "Scanning backup directory for files..."
+        find "$backup_dir" -name "n8n_backup_*.json" -exec basename {} \; | sort
+    fi
+}
+
+# Verify backup integrity
+verify_backup() {
+    local backup_file="$1"
+    
+    if [[ -z "$backup_file" ]]; then
+        error "Backup file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$backup_file" ]]; then
+        error "Backup file not found: $backup_file"
+        return 1
+    fi
+    
+    log "Verifying backup: $backup_file"
+    
+    # Check JSON validity
+    if ! jq '.' "$backup_file" >/dev/null 2>&1; then
+        error "Invalid JSON in backup file"
+        return 1
+    fi
+    
+    # Check backup structure
+    local backup_data=$(cat "$backup_file")
+    
+    if ! echo "$backup_data" | jq -e '.workflows.data' >/dev/null 2>&1; then
+        error "Invalid backup structure - missing workflows.data"
+        return 1
+    fi
+    
+    local workflow_count=$(echo "$backup_data" | jq '.workflows.data | length')
+    local backup_timestamp=$(echo "$backup_data" | jq -r '.backup_info.timestamp // .timestamp')
+    
+    success "Backup verification passed"
+    log "Backup timestamp: $backup_timestamp"
+    log "Workflows in backup: $workflow_count"
+    
+    # Verify each workflow structure
+    local invalid_workflows=0
+    for ((i=0; i<workflow_count; i++)); do
+        local workflow=$(echo "$backup_data" | jq ".workflows.data[$i]")
+        if ! echo "$workflow" | jq -e '.name and .nodes and .connections' >/dev/null 2>&1; then
+            ((invalid_workflows++))
+        fi
+    done
+    
+    if [[ $invalid_workflows -gt 0 ]]; then
+        warn "Found $invalid_workflows workflows with invalid structure"
+    else
+        success "All workflows have valid structure"
+    fi
+    
+    return 0
+}
+
+# Restore workflows from backup with enhanced validation
+restore_workflows() {
+    local backup_file="$1"
+    
+    if [[ -z "$backup_file" ]]; then
+        error "Backup file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$backup_file" ]]; then
+        error "Backup file not found: $backup_file"
+        return 1
+    fi
+    
+    # Verify backup first
+    if ! verify_backup "$backup_file"; then
+        error "Backup verification failed"
+        return 1
+    fi
+    
+    log "Restoring workflows from: $backup_file"
+    
+    local backup_data=$(cat "$backup_file")
+    local total_workflows=$(echo "$backup_data" | jq '.workflows.data | length')
+    local count=0
+    local failed=0
+    
+    warn "This will restore $total_workflows workflows. Continue? (y/N)"
+    read -r confirmation
+    
+    if [[ "$confirmation" != "y" && "$confirmation" != "Y" ]]; then
+        log "Restore cancelled"
+        return 0
+    fi
+    
+    echo "$backup_data" | jq -r '.workflows.data[]' | while IFS= read -r workflow; do
+        if [[ -n "$workflow" ]]; then
+            local name=$(echo "$workflow" | jq -r '.name')
+            log "Restoring: $name"
+            
+            # Remove fields that shouldn't be in create request
+            local clean_workflow=$(echo "$workflow" | jq 'del(.id, .createdAt, .updatedAt, .versionId)')
+            
+            local response=$(api_request "POST" "/workflows" "$clean_workflow")
+            
+            if echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+                ((count++))
+                success "✅ Restored: $name"
+            else
+                ((failed++))
+                warn "❌ Failed to restore $name: $response"
+            fi
+        fi
+    done
+    
+    success "Restore completed: $count successful, $failed failed"
+}
+
+# Restore workflows from backup with enhanced validation
+restore_workflows() {
+    local backup_file="$1"
+    
+    if [[ -z "$backup_file" ]]; then
+        error "Backup file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$backup_file" ]]; then
+        error "Backup file not found: $backup_file"
+        return 1
+    fi
+    
+    # Verify backup first
+    if ! verify_backup "$backup_file"; then
+        error "Backup verification failed"
+        return 1
+    fi
+    
+    log "Restoring workflows from: $backup_file"
+    
+    local backup_data=$(cat "$backup_file")
+    local total_workflows=$(echo "$backup_data" | jq '.workflows.data | length')
+    local count=0
+    local failed=0
+    
+    warn "This will restore $total_workflows workflows. Continue? (y/N)"
+    read -r confirmation
+    
+    if [[ "$confirmation" != "y" && "$confirmation" != "Y" ]]; then
+        log "Restore cancelled"
+        return 0
+    fi
+    
+    echo "$backup_data" | jq -r '.workflows.data[]' | while IFS= read -r workflow; do
+        if [[ -n "$workflow" ]]; then
+            local name=$(echo "$workflow" | jq -r '.name')
+            log "Restoring: $name"
+            
+            # Remove fields that shouldn't be in create request
+            local clean_workflow=$(echo "$workflow" | jq 'del(.id, .createdAt, .updatedAt, .versionId)')
+            
+            local response=$(api_request "POST" "/workflows" "$clean_workflow")
+            
+            if echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+                ((count++))
+                success "✅ Restored: $name"
+            else
+                ((failed++))
+                warn "❌ Failed to restore $name: $response"
+            fi
+        fi
+    done
+    
+    success "Restore completed: $count successful, $failed failed"
+}
+
+# ===================================================================
+# MONITORING AND STATS FUNCTIONS
+# ===================================================================
+
+# Get n8n statistics
+get_stats() {
+    log "Fetching n8n statistics..."
+    
+    # Get workflows
+    local workflows_response=$(api_request "GET" "/workflows")
+    local total_workflows=$(echo "$workflows_response" | jq '.data | length')
+    local active_workflows=$(echo "$workflows_response" | jq '.data | map(select(.active == true)) | length')
+    
+    # Get recent executions
+    local executions_response=$(api_request "GET" "/executions?limit=100")
+    local total_executions=$(echo "$executions_response" | jq '.data | length')
+    local successful_executions=$(echo "$executions_response" | jq '.data | map(select(.status == "success")) | length')
+    local failed_executions=$(echo "$executions_response" | jq '.data | map(select(.status == "error")) | length')
+    
+    echo ""
+    echo "📊 n8n Instance Statistics"
+    echo "=========================="
+    echo "🌐 URL: $N8N_URL"
+    echo "📝 Total Workflows: $total_workflows"
+    echo "✅ Active Workflows: $active_workflows"
+    echo "💤 Inactive Workflows: $((total_workflows - active_workflows))"
+    echo ""
+    echo "🔄 Recent Executions (last 100):"
+    echo "✅ Successful: $successful_executions"
+    echo "❌ Failed: $failed_executions"
+    echo "📊 Success Rate: $(( successful_executions * 100 / (successful_executions + failed_executions) ))%"
+    echo ""
+}
+
+# Monitor workflow executions
+monitor_executions() {
+    local workflow_id="$1"
+    local interval="${2:-30}"
+    
+    log "Monitoring executions (refresh every ${interval}s). Press Ctrl+C to stop."
+    
+    while true; do
+        clear
+        echo "🔄 Live Execution Monitor - $(date)"
+        echo "=================================="
+        
+        if [[ -n "$workflow_id" ]]; then
+            echo "Workflow ID: $workflow_id"
+            echo ""
+        fi
+        
+        list_executions "$workflow_id" 10
+        
+        sleep "$interval"
+    done
+}
+
+# ===================================================================
+# TEMPLATE AND EXPORT FUNCTIONS
+# ===================================================================
+
+# Export workflow as template
+export_template() {
+    local identifier="$1"
+    local output_file="$2"
+    
+    if [[ -z "$identifier" ]]; then
+        error "Workflow ID or name required"
+        return 1
+    fi
+    
+    # Get workflow
+    local workflow_data=$(get_workflow "$identifier")
+    
+    if [[ $? -ne 0 ]]; then
+        error "Failed to fetch workflow"
+        return 1
+    fi
+    
+    # Clean up for template (remove ID, credentials, etc.)
+    local template=$(echo "$workflow_data" | jq 'del(.data.id, .data.createdAt, .data.updatedAt)')
+    
+    if [[ -n "$output_file" ]]; then
+        echo "$template" | jq . > "$output_file"
+        success "Template exported to: $output_file"
+    else
+        echo "$template" | jq .
+    fi
+}
+
+# Import workflow from template
+import_template() {
+    local template_file="$1"
+    local workflow_name="$2"
+    
+    if [[ -z "$template_file" ]]; then
+        error "Template file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$template_file" ]]; then
+        error "Template file not found: $template_file"
+        return 1
+    fi
+    
+    log "Importing template: $template_file"
+    
+    local template_data=$(cat "$template_file")
+    
+    # Set custom name if provided
+    if [[ -n "$workflow_name" ]]; then
+        template_data=$(echo "$template_data" | jq ".name = \"$workflow_name\"")
+    fi
+    
+    create_workflow <(echo "$template_data")
+}
+
+# ===================================================================
+# WORKFLOW VALIDATION AND DEPLOYMENT
+# ===================================================================
+
+# Validate workflow JSON structure
+validate_workflow() {
+    local workflow_file="$1"
+    
+    if [[ -z "$workflow_file" ]]; then
+        error "Workflow file required"
+        return 1
+    fi
+    
+    if [[ ! -f "$workflow_file" ]]; then
+        error "File not found: $workflow_file"
+        return 1
+    fi
+    
+    log "Validating workflow: $workflow_file"
+    
+    # Check JSON syntax
+    if ! jq '.' "$workflow_file" >/dev/null 2>&1; then
+        error "Invalid JSON syntax in workflow file"
+        return 1
+    fi
+    
+    # Check required fields
+    local workflow_data=$(cat "$workflow_file")
+    
+    if ! echo "$workflow_data" | jq -e '.name' >/dev/null 2>&1; then
+        error "Missing required field: name"
+        return 1
+    fi
+    
+    if ! echo "$workflow_data" | jq -e '.nodes' >/dev/null 2>&1; then
+        error "Missing required field: nodes"
+        return 1
+    fi
+    
+    if ! echo "$workflow_data" | jq -e '.connections' >/dev/null 2>&1; then
+        error "Missing required field: connections"
+        return 1
+    fi
+    
+    local node_count=$(echo "$workflow_data" | jq '.nodes | length')
+    local workflow_name=$(echo "$workflow_data" | jq -r '.name')
+    
+    success "Workflow validation passed"
+    log "Name: $workflow_name"
+    log "Nodes: $node_count"
+    
+    return 0
+}
+
+# Deploy workflow with validation
+deploy_workflow() {
+    local workflow_file="$1"
+    local workflow_id="$2"
+    
+    if [[ -z "$workflow_file" ]]; then
+        error "Workflow file required"
+        return 1
+    fi
+    
+    # Validate first
+    if ! validate_workflow "$workflow_file"; then
+        error "Workflow validation failed"
+        return 1
+    fi
+    
+    if [[ -n "$workflow_id" ]]; then
+        log "Updating existing workflow: $workflow_id"
+        update_workflow "$workflow_id" "$workflow_file"
+    else
+        log "Creating new workflow"
+        create_workflow "$workflow_file"
+    fi
+}
+
+# Compare two workflows
+compare_workflows() {
+    local workflow1="$1"
+    local workflow2="$2"
+    
+    if [[ -z "$workflow1" || -z "$workflow2" ]]; then
+        error "Two workflow identifiers required"
+        return 1
+    fi
+    
+    log "Comparing workflows: $workflow1 vs $workflow2"
+    
+    # Get workflow data using direct API calls
+    local wf1_response wf2_response
+    wf1_response=$(api_request "GET" "/workflows/$workflow1")
+    wf2_response=$(api_request "GET" "/workflows/$workflow2")
+    
+    if ! echo "$wf1_response" | jq -e '.id' >/dev/null 2>&1; then
+        error "Failed to fetch workflow: $workflow1"
+        return 1
+    fi
+    
+    if ! echo "$wf2_response" | jq -e '.id' >/dev/null 2>&1; then
+        error "Failed to fetch workflow: $workflow2"
+        return 1
+    fi
+    
+    # Compare key fields
+    local wf1_name wf2_name wf1_nodes wf2_nodes wf1_active wf2_active
+    wf1_name=$(echo "$wf1_response" | jq -r '.name // "Unknown"')
+    wf2_name=$(echo "$wf2_response" | jq -r '.name // "Unknown"')
+    wf1_nodes=$(echo "$wf1_response" | jq '.nodes | length')
+    wf2_nodes=$(echo "$wf2_response" | jq '.nodes | length')
+    wf1_active=$(echo "$wf1_response" | jq -r '.active // false')
+    wf2_active=$(echo "$wf2_response" | jq -r '.active // false')
+    
+    echo ""
+    echo "🔍 Workflow Comparison"
+    echo "====================="
+    echo "Workflow 1: $wf1_name ($workflow1)"
+    echo "  Nodes: $wf1_nodes"
+    echo "  Status: $(if [[ "$wf1_active" == "true" ]]; then echo "✅ Active"; else echo "⭕ Inactive"; fi)"
+    echo ""
+    echo "Workflow 2: $wf2_name ($workflow2)"
+    echo "  Nodes: $wf2_nodes"
+    echo "  Status: $(if [[ "$wf2_active" == "true" ]]; then echo "✅ Active"; else echo "⭕ Inactive"; fi)"
+    echo ""
+    
+    # Comparison summary
+    echo "📊 Comparison Summary"
+    echo "===================="
+    if [[ "$wf1_nodes" != "$wf2_nodes" ]]; then
+        warn "⚠️  Different number of nodes: $wf1_nodes vs $wf2_nodes"
+    else
+        success "✅ Same number of nodes: $wf1_nodes"
+    fi
+    
+    if [[ "$wf1_active" != "$wf2_active" ]]; then
+        warn "⚠️  Different active status"
+    else
+        success "✅ Same active status"
+    fi
+}
+
+# ===================================================================
+# HELP AND DOCUMENTATION
+# ===================================================================
+
+show_help() {
+    cat << EOF
+🚀 n8n Advanced CLI Tool
+========================
+
+DESCRIPTION:
+    Comprehensive command-line interface for managing n8n workflows.
+    Configuration is loaded from .env file or environment variables.
+
+CONFIGURATION:
+    Create a .env file in the same directory as this script with:
+    
+    N8N_URL=https://your-n8n-instance.com
+    N8N_API_KEY=your_api_key_here
+    DEFAULT_BACKUP_DIR=./backups
+    DEFAULT_EXECUTION_LIMIT=20
+    ENABLE_DEBUG=false
+    ENABLE_COLORS=true
+    API_TIMEOUT=30
+    API_MAX_RETRIES=3
+
+USAGE:
+    n8n-cli <command> [options]
+
+WORKFLOW COMMANDS:
+    list                          List all workflows
+    search <term> [type]         Search workflows (type: name, content, both)
+    get <id|name>                Get workflow details
+    create <file.json>           Create workflow from JSON file
+    update <id|name> <file.json> Update existing workflow
+    delete <id|name>             Delete workflow
+    activate <id|name>           Activate workflow
+    deactivate <id|name>         Deactivate workflow
+    execute <id|name> [data]     Execute workflow with optional input
+
+EXECUTION COMMANDS:
+    executions [workflow_id] [limit]  List executions with enhanced formatting
+    execution <execution_id>          Get execution summary
+    exec-full <execution_id>          Get full execution details (JSON)
+    monitor [workflow_id] [interval]  Monitor executions live
+
+WEBHOOK COMMANDS:
+    webhook <path> [data] [method]    Send webhook request (default: POST)
+    test-webhook <path>               Test webhook connectivity
+
+BACKUP COMMANDS:
+    backup [directory]           Enhanced backup with metadata
+    restore <backup_file>        Restore workflows with validation
+    list-backups [directory]     List available backups
+    verify-backup <file>         Verify backup integrity
+
+TEMPLATE COMMANDS:
+    export <id|name> [file]      Export workflow as template
+    import <template_file> [name] Import template as new workflow
+
+MONITORING COMMANDS:
+    stats                        Show n8n instance statistics
+    monitor                      Live execution monitoring
+
+VALIDATION COMMANDS:
+    validate <file.json>         Validate workflow JSON structure
+    deploy <file.json> [id]      Deploy workflow with validation
+    compare <id1|name1> <id2|name2>  Compare two workflows
+
+TESTING COMMANDS:
+    test                         Test basic API connectivity
+    test-all [workflow_id]       Run comprehensive test suite
+    benchmark [iterations]       Performance benchmark
+
+UTILITY COMMANDS:
+    help                         Show this help message
+    version                      Show version information
+    debug                        Enable debug mode for troubleshooting
+
+EXAMPLES:
+    # List all workflows
+    n8n-cli list
+
+    # Search workflows by name
+    n8n-cli search "backup" name
+    n8n-cli search "ffmpeg" both
+
+    # Get workflow by name
+    n8n-cli get "Daily Backup"
+
+    # Create workflow from file
+    n8n-cli create ./workflows/my-workflow.json
+
+    # Execute workflow with data
+    n8n-cli execute "Data Sync" '{"param": "value"}'
+
+    # Send webhook request
+    n8n-cli webhook ffmpeg-result '{"message": "test"}'
+    n8n-cli webhook /webhook/ffmpeg-result '{"command": {"inputs": []}}'
+
+    # Test webhook connectivity
+    n8n-cli test-webhook ffmpeg-result
+
+    # List executions for specific workflow
+    n8n-cli executions QFErgCBsHyJn9glG 10
+
+    # Get execution details
+    n8n-cli execution 184887
+    n8n-cli exec-full 184887
+
+    # Backup all workflows
+    n8n-cli backup ./backups
+
+    # Monitor executions live
+    n8n-cli monitor 123 10
+
+    # Export workflow as template
+    n8n-cli export "Daily Backup" ./templates/backup-template.json
+
+CONFIGURATION:
+    URL: Configured via .env file or N8N_URL environment variable
+    API: Authenticated with API key from .env file or N8N_API_KEY environment variable
+    
+    Copy .env.example to .env and configure your settings.
+
+For more information, visit: https://docs.n8n.io/api/
+EOF
+}
+
+show_version() {
+    echo "n8n CLI Tool v2.0.0"
+    echo "Target: $N8N_URL"
+    echo "Built: $(date)"
+}
+
+# Test API connectivity
+test_connection() {
+    log "Testing connection to $N8N_URL..."
+    
+    local response=$(api_request "GET" "/workflows?limit=1")
+    
+    # Check if we got a valid JSON response with data
+    if echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        success "Connection successful!"
+        local count=$(echo "$response" | jq '.data | length')
+        log "Retrieved $count workflow(s) from the API"
+        return 0
+    else
+        error "Connection failed: $response"
+        return 1
+    fi
+}
+
+# ===================================================================
+# MAIN COMMAND DISPATCHER
+# ===================================================================
+
+main() {
+    local command="$1"
+    shift || true
+    
+    case "$command" in
+        # Workflow management
+        "list"|"ls")
+            list_workflows "$@"
+            ;;
+        "search"|"find")
+            search_workflows "$@"
+            ;;
+        "get"|"show")
+            get_workflow "$@"
+            ;;
+        "create"|"add")
+            create_workflow "$@"
+            ;;
+        "update"|"edit")
+            update_workflow "$@"
+            ;;
+        "delete"|"rm")
+            delete_workflow "$@"
+            ;;
+        "activate"|"enable")
+            toggle_workflow "$1" "activate"
+            ;;
+        "deactivate"|"disable")
+            toggle_workflow "$1" "deactivate"
+            ;;
+        "execute"|"run")
+            execute_workflow "$@"
+            ;;
+            
+        # Execution management
+        "executions"|"execs")
+            list_executions "$@"
+            ;;
+        "execution"|"exec")
+            get_execution_details "$@"
+            ;;
+        "exec-full")
+            get_execution_details "$1" "true"
+            ;;
+            
+        # Webhook management
+        "webhook"|"wh")
+            send_webhook "$@"
+            ;;
+        "test-webhook"|"test-wh")
+            test_webhook "$@"
+            ;;
+            
+        # Backup and restore
+        "backup")
+            backup_workflows "$@"
+            ;;
+        "restore")
+            restore_workflows "$@"
+            ;;
+        "list-backups")
+            list_backups "$@"
+            ;;
+        "verify-backup")
+            verify_backup "$@"
+            ;;
+            
+        # Templates
+        "export")
+            export_template "$@"
+            ;;
+        "import")
+            import_template "$@"
+            ;;
+            
+        # Monitoring
+        "stats"|"status")
+            get_stats "$@"
+            ;;
+        "monitor"|"watch")
+            monitor_executions "$@"
+            ;;
+            
+        # Validation and deployment
+        "validate")
+            validate_workflow "$@"
+            ;;
+        "deploy")
+            deploy_workflow "$@"
+            ;;
+        "compare")
+            compare_workflows "$@"
+            ;;
+            
+        # Utility
+        "help"|"-h"|"--help")
+            show_help
+            ;;
+        "version"|"-v"|"--version")
+            show_version
+            ;;
+        "test")
+            test_connection
+            ;;
+        "test-all")
+            run_comprehensive_tests "$@"
+            ;;
+        "benchmark")
+            benchmark_api "$@"
+            ;;
+        "debug")
+            set -x
+            log "Debug mode enabled"
+            ;;
+            
+        # Default
+        "")
+            show_help
+            ;;
+        *)
+            error "Unknown command: $command"
+            echo ""
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# ===================================================================
+# SCRIPT EXECUTION
+# ===================================================================
+
+# Check dependencies
+if ! command -v curl >/dev/null 2>&1; then
+    error "curl is required but not installed"
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    error "jq is required but not installed"
+    exit 1
+fi
+
+# Validate configuration before executing
+if ! validate_config; then
+    error "Configuration validation failed. Please check your .env file or environment variables."
+    error "Create a .env file based on .env.example or set environment variables directly."
+    exit 1
+fi
+
+# Execute main function
+main "$@"
