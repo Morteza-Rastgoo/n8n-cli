@@ -1,2 +1,11 @@
 Readme.md
 .env
+mcp/.trae/
+mcp/.vscode/
+mcp/configs/
+mcp/docs/
+mcp/tests/
+mcp/tools/
+mcp/workflows/
+workflows/
+backups/
