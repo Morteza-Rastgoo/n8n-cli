@@ -68,12 +68,12 @@ else
     NC=''
 fi
 
-# Utility functions
-log() { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; }
-debug() { [[ "$ENABLE_DEBUG" == "true" ]] && echo -e "${CYAN}[DEBUG]${NC} $1"; }
-success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+# Utility functions - All log output goes to stderr to prevent JSON contamination
+log() { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+debug() { [[ "$ENABLE_DEBUG" == "true" ]] && echo -e "${CYAN}[DEBUG]${NC} $1" >&2; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $1" >&2; }
 
 # Enhanced configuration validation
 validate_config() {
@@ -250,7 +250,7 @@ get_workflow() {
         
         # Check if we got a valid response (direct workflow response doesn't have .data wrapper)
         if echo "$response" | jq -e '.id' >/dev/null 2>&1; then
-            echo "$response" | jq .
+            echo "$response" | jq . 2>/dev/null || echo "$response"
             return 0
         fi
     fi
@@ -272,7 +272,7 @@ get_workflow() {
         return 1
     fi
     
-    echo "$response" | jq .
+    echo "$response" | jq . 2>/dev/null || echo "$response"
 }
 
 # Create workflow
@@ -299,11 +299,17 @@ create_workflow() {
         return 1
     fi
     
-    local workflow_id=$(echo "$response" | jq -r '.data.id')
-    local workflow_name=$(echo "$response" | jq -r '.data.name')
+    # Validate JSON before processing
+    if ! echo "$response" | jq . >/dev/null 2>&1; then
+        error "Invalid JSON response from API"
+        return 1
+    fi
+    
+    local workflow_id=$(echo "$response" | jq -r '.id // empty')
+    local workflow_name=$(echo "$response" | jq -r '.name // empty')
     
     success "Created workflow: $workflow_name (ID: $workflow_id)"
-    echo "$response" | jq .
+    echo "$response" | jq . 2>/dev/null || echo "$response"
 }
 
 # Update workflow
@@ -349,7 +355,7 @@ update_workflow() {
     fi
     
     success "Updated workflow: $identifier"
-    echo "$response" | jq .
+    echo "$response" | jq . 2>/dev/null || echo "$response"
 }
 
 # Delete workflow
@@ -441,8 +447,10 @@ toggle_workflow() {
     
     local response=$(api_request "POST" "$endpoint" "{}")
     
-    if [[ "$response" == *"error"* ]]; then
-        error "Failed to $action workflow: $response"
+    # Check if the API call succeeded (200 status is success for activate/deactivate)
+    if [[ $? -ne 0 ]]; then
+        local error_msg=$(echo "$response" | jq -r '.message // "Unknown error"' 2>/dev/null || echo "API request failed")
+        error "Failed to $action workflow: $error_msg"
         return 1
     fi
     
@@ -484,15 +492,42 @@ execute_workflow() {
     
     local data="${input_data:-{}}"
     local response=$(api_request "POST" "/workflows/$identifier/execute" "$data")
+    local api_exit_code=$?
     
-    if [[ "$response" == *"error"* ]]; then
-        error "Failed to execute workflow: $response"
+    if [[ $api_exit_code -ne 0 ]]; then
+        error "Failed to execute workflow"
         return 1
     fi
     
-    local execution_id=$(echo "$response" | jq -r '.data.id')
-    success "Started execution: $execution_id"
-    echo "$response" | jq .
+    # Check if response indicates an error
+    if echo "$response" | jq -e '.message' >/dev/null 2>&1; then
+        local error_msg=$(echo "$response" | jq -r '.message')
+        if [[ "$error_msg" == *"error"* ]] || [[ "$error_msg" == *"failed"* ]]; then
+            error "Failed to execute workflow: $error_msg"
+            return 1
+        fi
+    fi
+    
+    # Try to extract execution ID from different possible response formats
+    local execution_id=""
+    if echo "$response" | jq -e '.data.id' >/dev/null 2>&1; then
+        execution_id=$(echo "$response" | jq -r '.data.id')
+    elif echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+        execution_id=$(echo "$response" | jq -r '.id')
+    fi
+    
+    if [[ -n "$execution_id" && "$execution_id" != "null" ]]; then
+        success "Started execution: $execution_id"
+    else
+        success "Workflow execution triggered"
+    fi
+    
+    # Only output JSON if it's valid
+    if echo "$response" | jq . >/dev/null 2>&1; then
+        echo "$response" | jq .
+    else
+        echo "$response"
+    fi
 }
 
 # Search workflows by name or content
@@ -570,22 +605,45 @@ send_webhook() {
     log "Sending $method request to webhook: $url"
     
     local webhook_data="${data:-{}}"
+    local response
+    local http_code
     
     if [[ "$method" == "GET" ]]; then
-        curl -s -X GET "$url" \
-            -H "Content-Type: application/json"
+        response=$(curl -s -w "\\n%{http_code}" -X GET "$url" \
+            -H "Content-Type: application/json" 2>/dev/null)
     else
-        curl -s -X "$method" "$url" \
+        response=$(curl -s -w "\\n%{http_code}" -X "$method" "$url" \
             -H "Content-Type: application/json" \
-            --data-raw "$webhook_data"
+            --data-raw "$webhook_data" 2>/dev/null)
     fi
     
-    local exit_code=$?
-    if [[ $exit_code -eq 0 ]]; then
-        success "Webhook request sent successfully"
+    if [[ -n "$response" ]]; then
+        http_code=$(echo "$response" | tail -n1)
+        response=$(echo "$response" | sed '$d')
     else
-        error "Webhook request failed with exit code: $exit_code"
-        return $exit_code
+        http_code="000"
+        response="No response"
+    fi
+    
+    # Display response
+    echo "$response"
+    
+    # Check HTTP status code
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        success "Webhook request sent successfully (HTTP $http_code)"
+        return 0
+    elif [[ "$http_code" == "404" ]]; then
+        error "Webhook not found (HTTP 404)"
+        return 1
+    elif [[ "$http_code" =~ ^4[0-9][0-9]$ ]]; then
+        error "Client error (HTTP $http_code)"
+        return 1
+    elif [[ "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+        error "Server error (HTTP $http_code)"
+        return 1
+    else
+        error "Request failed (HTTP $http_code)"
+        return 1
     fi
 }
 
@@ -1273,7 +1331,19 @@ import_template() {
         template_data=$(echo "$template_data" | jq ".name = \"$workflow_name\"")
     fi
     
-    create_workflow <(echo "$template_data")
+    # Create temporary file for template data
+    local temp_file=$(mktemp)
+    echo "$template_data" > "$temp_file"
+    
+    # Create workflow
+    local result=$(create_workflow "$temp_file")
+    local exit_code=$?
+    
+    # Clean up temp file
+    rm -f "$temp_file"
+    
+    echo "$result"
+    return $exit_code
 }
 
 # ===================================================================
@@ -1420,8 +1490,254 @@ compare_workflows() {
 }
 
 # ===================================================================
-# HELP AND DOCUMENTATION
+# CREDENTIAL MANAGEMENT FUNCTIONS
 # ===================================================================
+
+# List all credentials
+list_credentials() {
+    log "Fetching credentials from $N8N_URL..."
+    
+    local response=$(api_request "GET" "/credentials" 2>/dev/null)
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        warn "Credentials endpoint not available or access denied"
+        echo "This feature may require Enterprise license or different permissions"
+        return 1
+    fi
+    
+    if ! echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        warn "Credentials endpoint returned: $response"
+        return 1
+    fi
+    
+    echo "ID | NAME | TYPE | SHARED"
+    echo "$response" | jq -r '.data[] | "\(.id) | \(.name) | \(.type) | \(.sharedWith // [] | length > 0)"' | column -t -s '|'
+    
+    local count=$(echo "$response" | jq '.data | length')
+    success "Found $count credentials"
+}
+
+# Get credential by ID
+get_credential() {
+    local credential_id="$1"
+    
+    if [[ -z "$credential_id" ]]; then
+        error "Credential ID required"
+        return 1
+    fi
+    
+    log "Fetching credential: $credential_id"
+    
+    local response=$(api_request "GET" "/credentials/$credential_id" 2>/dev/null)
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        error "Failed to fetch credential or access denied"
+        return 1
+    fi
+    
+    if ! echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+        error "Failed to fetch credential: $response"
+        return 1
+    fi
+    
+    echo "$response" | jq .
+}
+
+# ===================================================================
+# USER MANAGEMENT FUNCTIONS
+# ===================================================================
+
+# List all users
+list_users() {
+    log "Fetching users from $N8N_URL..."
+    
+    local response=$(api_request "GET" "/users")
+    
+    if ! echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+        error "Failed to fetch users: $response"
+        return 1
+    fi
+    
+    echo "ID | EMAIL | ROLE | STATUS"
+    echo "$response" | jq -r '.data[] | "\(.id) | \(.email) | \(.role // "N/A") | \(if .isPending then "Pending" else "Active" end)"' | column -t -s '|'
+    
+    local count=$(echo "$response" | jq '.data | length')
+    success "Found $count users"
+}
+
+# Get user by ID
+get_user() {
+    local user_id="$1"
+    
+    if [[ -z "$user_id" ]]; then
+        error "User ID required"
+        return 1
+    fi
+    
+    log "Fetching user: $user_id"
+    
+    local response=$(api_request "GET" "/users/$user_id?includeRole=true")
+    
+    if ! echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+        error "Failed to fetch user: $response"
+        return 1
+    fi
+    
+    echo "$response" | jq .
+}
+
+# ===================================================================
+# ADVANCED EXECUTION MANAGEMENT
+# ===================================================================
+
+# Stop execution
+stop_execution() {
+    local execution_id="$1"
+    
+    if [[ -z "$execution_id" ]]; then
+        error "Execution ID required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$execution_id" =~ https?://[^/]+/workflow/[^/]+/executions/([^/]+) ]]; then
+        execution_id="${BASH_REMATCH[1]}"
+        log "Extracted execution ID from URL: $execution_id"
+    fi
+    
+    log "Stopping execution: $execution_id"
+    
+    local response=$(api_request "POST" "/executions/$execution_id/stop" "{}")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to stop execution: $response"
+        return 1
+    fi
+    
+    success "Execution stopped: $execution_id"
+    echo "$response" | jq .
+}
+
+# Delete execution
+delete_execution() {
+    local execution_id="$1"
+    
+    if [[ -z "$execution_id" ]]; then
+        error "Execution ID required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$execution_id" =~ https?://[^/]+/workflow/[^/]+/executions/([^/]+) ]]; then
+        execution_id="${BASH_REMATCH[1]}"
+        log "Extracted execution ID from URL: $execution_id"
+    fi
+    
+    warn "Are you sure you want to delete execution $execution_id? (y/N)"
+    read -r confirmation
+    
+    if [[ "$confirmation" != "y" && "$confirmation" != "Y" ]]; then
+        log "Deletion cancelled"
+        return 0
+    fi
+    
+    log "Deleting execution: $execution_id"
+    
+    local response=$(api_request "DELETE" "/executions/$execution_id")
+    
+    if [[ "$response" == *"error"* ]]; then
+        error "Failed to delete execution: $response"
+        return 1
+    fi
+    
+    success "Execution deleted: $execution_id"
+}
+
+# ===================================================================
+# WORKFLOW SHARING AND ADVANCED FEATURES
+# ===================================================================
+
+# Duplicate workflow
+duplicate_workflow() {
+    local identifier="$1"
+    local new_name="$2"
+    
+    if [[ -z "$identifier" ]]; then
+        error "Workflow ID or name required"
+        return 1
+    fi
+    
+    # Parse URL if provided
+    if [[ "$identifier" =~ https?://[^/]+/workflow/([^/]+) ]]; then
+        identifier="${BASH_REMATCH[1]}"
+        log "Extracted workflow ID from URL: $identifier"
+    fi
+    
+    # Get workflow ID if name provided
+    if [[ ! "$identifier" =~ ^[a-zA-Z0-9]+$ ]]; then
+        local all_workflows=$(api_request "GET" "/workflows")
+        identifier=$(echo "$all_workflows" | jq -r ".data[] | select(.name == \"$identifier\") | .id")
+        
+        if [[ -z "$identifier" ]]; then
+            error "Workflow not found"
+            return 1
+        fi
+    fi
+    
+    log "Duplicating workflow: $identifier"
+    
+    # Try the duplicate endpoint first
+    local request_data="{}"
+    if [[ -n "$new_name" ]]; then
+        request_data=$(echo '{}' | jq --arg name "$new_name" '.name = $name')
+    fi
+    
+    local response=$(api_request "POST" "/workflows/$identifier/duplicate" "$request_data" 2>/dev/null)
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]] && echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+        local new_workflow_id=$(echo "$response" | jq -r '.id // empty')
+        local new_workflow_name=$(echo "$response" | jq -r '.name // empty')
+        success "Duplicated workflow: $new_workflow_name (ID: $new_workflow_id)"
+        echo "$response" | jq .
+        return 0
+    fi
+    
+    # Fallback: Manual duplication by getting workflow and creating new one
+    warn "Duplicate endpoint not available, using manual duplication"
+    
+    local workflow_data=$(get_workflow "$identifier")
+    if [[ $? -ne 0 ]]; then
+        error "Failed to get source workflow for duplication"
+        return 1
+    fi
+    
+    # Modify the workflow for duplication
+    local duplicate_name="${new_name:-$(echo "$workflow_data" | jq -r '.name') Copy}"
+    local clean_workflow=$(echo "$workflow_data" | jq --arg name "$duplicate_name" 'del(.id, .createdAt, .updatedAt, .versionId) | .name = $name')
+    
+    # Create temporary file
+    local temp_file=$(mktemp)
+    echo "$clean_workflow" > "$temp_file"
+    
+    # Create the duplicate
+    local result=$(create_workflow "$temp_file")
+    local create_exit_code=$?
+    
+    # Clean up temp file
+    rm -f "$temp_file"
+    
+    if [[ $create_exit_code -eq 0 ]]; then
+        success "Successfully duplicated workflow manually"
+        echo "$result"
+        return 0
+    else
+        error "Failed to duplicate workflow: $result"
+        return 1
+    fi
+}
 
 show_help() {
     cat << EOF
@@ -1457,12 +1773,23 @@ WORKFLOW COMMANDS:
     activate <id|name>           Activate workflow
     deactivate <id|name>         Deactivate workflow
     execute <id|name> [data]     Execute workflow with optional input
+    deploy-workflow <file.json>  Alias for 'deploy' command
 
 EXECUTION COMMANDS:
     executions [workflow_id] [limit]  List executions with enhanced formatting
     execution <execution_id>          Get execution summary
     exec-full <execution_id>          Get full execution details (JSON)
+    stop-execution <execution_id>     Stop running execution
+    delete-execution <execution_id>   Delete execution
     monitor [workflow_id] [interval]  Monitor executions live
+
+USER MANAGEMENT COMMANDS:
+    users                            List all users
+    user <user_id>                   Get user details
+
+CREDENTIAL MANAGEMENT COMMANDS:
+    credentials                      List all credentials
+    credential <credential_id>       Get credential details
 
 WEBHOOK COMMANDS:
     webhook <path> [data] [method]    Send webhook request (default: POST)
@@ -1486,6 +1813,7 @@ VALIDATION COMMANDS:
     validate <file.json>         Validate workflow JSON structure
     deploy <file.json> [id]      Deploy workflow with validation
     compare <id1|name1> <id2|name2>  Compare two workflows
+    duplicate <id|name> [name]   Duplicate existing workflow
 
 TESTING COMMANDS:
     test                         Test basic API connectivity
@@ -1619,6 +1947,33 @@ main() {
         "exec-full")
             get_execution_details "$1" "true"
             ;;
+        "stop-execution"|"stop")
+            stop_execution "$@"
+            ;;
+        "delete-execution"|"del-exec")
+            delete_execution "$@"
+            ;;
+            
+        # User management
+        "users")
+            list_users "$@"
+            ;;
+        "user")
+            get_user "$@"
+            ;;
+            
+        # Credential management
+        "credentials"|"creds")
+            list_credentials "$@"
+            ;;
+        "credential"|"cred")
+            get_credential "$@"
+            ;;
+            
+        # Advanced workflow features
+        "duplicate"|"dup")
+            duplicate_workflow "$@"
+            ;;
             
         # Webhook management
         "webhook"|"wh")
@@ -1662,7 +2017,7 @@ main() {
         "validate")
             validate_workflow "$@"
             ;;
-        "deploy")
+        "deploy"|"deploy-workflow")
             deploy_workflow "$@"
             ;;
         "compare")
