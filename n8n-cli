@@ -1774,6 +1774,7 @@ WORKFLOW COMMANDS:
     deactivate <id|name>         Deactivate workflow
     execute <id|name> [data]     Execute workflow with optional input
     deploy-workflow <file.json>  Alias for 'deploy' command
+    deploy-workflow <file.json>  Alias for 'deploy' command
 
 EXECUTION COMMANDS:
     executions [workflow_id] [limit]  List executions with enhanced formatting
