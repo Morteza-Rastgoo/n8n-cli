@@ -41,6 +41,8 @@ N8N_API_KEY="${N8N_API_KEY:-}"
 DEFAULT_BACKUP_DIR="${DEFAULT_BACKUP_DIR:-./backups}"
 DEFAULT_EXECUTION_LIMIT="${DEFAULT_EXECUTION_LIMIT:-20}"
 DEFAULT_BENCHMARK_ITERATIONS="${DEFAULT_BENCHMARK_ITERATIONS:-5}"
+DEFAULT_EXECUTION_TIMEOUT="${DEFAULT_EXECUTION_TIMEOUT:-3600}"  # 1 hour default
+DEFAULT_POLLING_INTERVAL="${DEFAULT_POLLING_INTERVAL:-5}"      # 5 seconds default
 ENABLE_DEBUG="${ENABLE_DEBUG:-false}"
 ENABLE_COLORS="${ENABLE_COLORS:-true}"
 API_TIMEOUT="${API_TIMEOUT:-30}"
@@ -461,10 +463,13 @@ toggle_workflow() {
     fi
 }
 
-# Execute workflow
+# Execute workflow with enhanced waiting capabilities
 execute_workflow() {
     local identifier="$1"
     local input_data="$2"
+    local wait_for_completion="${3:-true}"  # Default to waiting
+    local timeout="${4:-$DEFAULT_EXECUTION_TIMEOUT}"
+    local polling_interval="${5:-$DEFAULT_POLLING_INTERVAL}"
     
     if [[ -z "$identifier" ]]; then
         error "Workflow ID or name required"
@@ -518,16 +523,150 @@ execute_workflow() {
     
     if [[ -n "$execution_id" && "$execution_id" != "null" ]]; then
         success "Started execution: $execution_id"
+        
+        if [[ "$wait_for_completion" == "true" ]]; then
+            log "Waiting for execution completion (timeout: ${timeout}s, polling every ${polling_interval}s)..."
+            wait_for_execution "$execution_id" "$timeout" "$polling_interval"
+            return $?
+        fi
     else
         success "Workflow execution triggered"
     fi
     
-    # Only output JSON if it's valid
-    if echo "$response" | jq . >/dev/null 2>&1; then
-        echo "$response" | jq .
-    else
-        echo "$response"
+    # Only output JSON if not waiting
+    if [[ "$wait_for_completion" != "true" ]]; then
+        if echo "$response" | jq . >/dev/null 2>&1; then
+            echo "$response" | jq .
+        else
+            echo "$response"
+        fi
     fi
+}
+
+# Wait for execution completion with detailed monitoring
+wait_for_execution() {
+    local execution_id="$1"
+    local timeout="${2:-$DEFAULT_EXECUTION_TIMEOUT}"
+    local polling_interval="${3:-$DEFAULT_POLLING_INTERVAL}"
+    
+    if [[ -z "$execution_id" ]]; then
+        error "Execution ID required"
+        return 1
+    fi
+    
+    local start_time=$(date +%s)
+    local end_time=$((start_time + timeout))
+    local last_status="unknown"
+    local dots_count=0
+    
+    while true; do
+        local current_time=$(date +%s)
+        
+        # Check timeout
+        if [[ $current_time -gt $end_time ]]; then
+            echo ""
+            warn "⏰ Execution timeout reached (${timeout}s)"
+            warn "Execution may still be running. Check manually with: ./n8n-cli execution $execution_id"
+            return 2
+        fi
+        
+        # Get execution details
+        local execution_data=$(api_request "GET" "/executions/$execution_id" 2>/dev/null)
+        
+        if echo "$execution_data" | jq -e '.id' >/dev/null 2>&1; then
+            local status=$(echo "$execution_data" | jq -r '.status // "unknown"')
+            local mode=$(echo "$execution_data" | jq -r '.mode // "unknown"')
+            local elapsed_time=$((current_time - start_time))
+            
+            # Show progress indicator for running executions
+            if [[ "$status" == "running" || "$status" == "new" || "$status" == "waiting" ]]; then
+                if [[ "$last_status" != "$status" ]]; then
+                    if [[ "$last_status" != "unknown" ]]; then
+                        echo "" # New line after dots
+                    fi
+                    log "Status: $status (${elapsed_time}s elapsed)"
+                    last_status="$status"
+                    dots_count=0
+                fi
+                
+                # Show progress dots
+                printf "."
+                dots_count=$((dots_count + 1))
+                
+                # New line every 60 dots (5 minutes at 5s intervals)
+                if [[ $((dots_count % 60)) -eq 0 ]]; then
+                    echo " (${elapsed_time}s)"
+                    dots_count=0
+                fi
+                
+                sleep "$polling_interval"
+                continue
+            fi
+            
+            # Execution completed
+            echo "" # New line after dots
+            
+            local stopped_at=$(echo "$execution_data" | jq -r '.stoppedAt // "unknown"')
+            local started_at=$(echo "$execution_data" | jq -r '.startedAt // "unknown"')
+            
+            echo ""
+            echo "🎯 Execution Completed"
+            echo "===================="
+            echo "ID: $execution_id"
+            echo "Status: $status"
+            echo "Mode: $mode"
+            echo "Started: $started_at"
+            echo "Stopped: $stopped_at"
+            echo "Total Time: ${elapsed_time}s"
+            echo ""
+            
+            if [[ "$status" == "success" ]]; then
+                success "✅ Execution completed successfully!"
+                
+                # Show output data if available
+                local output_data=$(echo "$execution_data" | jq '.data.resultData.runData // {}')
+                if [[ "$output_data" != "{}" && "$output_data" != "null" ]]; then
+                    echo ""
+                    echo "📋 Execution Output:"
+                    echo "==================="
+                    echo "$output_data" | jq .
+                fi
+                
+                return 0
+                
+            elif [[ "$status" == "error" ]]; then
+                error "❌ Execution failed!"
+                
+                # Show error details
+                local error_data=$(echo "$execution_data" | jq '.data.resultData.error // {}')
+                if [[ "$error_data" != "{}" && "$error_data" != "null" ]]; then
+                    echo ""
+                    echo "🚨 Error Details:"
+                    echo "================"
+                    echo "$error_data" | jq .
+                fi
+                
+                # Show node execution data for debugging
+                local run_data=$(echo "$execution_data" | jq '.data.resultData.runData // {}')
+                if [[ "$run_data" != "{}" && "$run_data" != "null" ]]; then
+                    echo ""
+                    echo "🔍 Node Execution Data:"
+                    echo "======================="
+                    echo "$run_data" | jq 'to_entries | map({node: .key, status: (.value[0].error // "success"), data: (.value[0].data // "no data")})'
+                fi
+                
+                return 1
+                
+            else
+                warn "⚠️  Execution ended with status: $status"
+                echo "$execution_data" | jq .
+                return 1
+            fi
+        else
+            error "Failed to get execution details"
+            return 1
+        fi
+    done
 }
 
 # Search workflows by name or content
@@ -1755,6 +1894,8 @@ CONFIGURATION:
     N8N_API_KEY=your_api_key_here
     DEFAULT_BACKUP_DIR=./backups
     DEFAULT_EXECUTION_LIMIT=20
+    DEFAULT_EXECUTION_TIMEOUT=3600
+    DEFAULT_POLLING_INTERVAL=5
     ENABLE_DEBUG=false
     ENABLE_COLORS=true
     API_TIMEOUT=30
@@ -1773,6 +1914,9 @@ WORKFLOW COMMANDS:
     activate <id|name>           Activate workflow
     deactivate <id|name>         Deactivate workflow
     execute <id|name> [data]     Execute workflow with optional input
+    execute-wait <id|name> [data] [timeout] [interval]  Execute and wait for completion
+    execute-nowait <id|name> [data]  Execute without waiting
+    wait-execution <execution_id> [timeout] [interval]  Wait for existing execution
     deploy-workflow <file.json>  Alias for 'deploy' command
     deploy-workflow <file.json>  Alias for 'deploy' command
 
@@ -1780,6 +1924,10 @@ EXECUTION COMMANDS:
     executions [workflow_id] [limit]  List executions with enhanced formatting
     execution <execution_id>          Get execution summary
     exec-full <execution_id>          Get full execution details (JSON)
+    execute <id|name> [data]          Execute workflow with waiting (default)
+    execute-wait <id|name> [data] [timeout] [interval]  Execute and wait for completion
+    execute-nowait <id|name> [data]   Execute without waiting
+    wait-execution <execution_id> [timeout] [interval]  Wait for existing execution
     stop-execution <execution_id>     Stop running execution
     delete-execution <execution_id>   Delete execution
     monitor [workflow_id] [interval]  Monitor executions live
@@ -1840,8 +1988,26 @@ EXAMPLES:
     # Create workflow from file
     n8n-cli create ./workflows/my-workflow.json
 
-    # Execute workflow with data
+    # Execute workflow with data (waits for completion by default)
     n8n-cli execute "Data Sync" '{"param": "value"}'
+    
+    # Execute and wait with custom timeout (useful for long-running workflows like FFMPEG)
+    n8n-cli execute-wait "FFMPEG Processing" '{"video_url": "..."}' 3600 10
+    
+    # Execute without waiting (fire and forget)
+    n8n-cli execute-nowait "Background Task" '{"data": "value"}'
+    
+    # Wait for existing execution with 2 hour timeout, check every 5 seconds
+    n8n-cli wait-execution 185734 7200 5
+    
+    # Execute and wait for completion (useful for long-running workflows)
+    n8n-cli execute-wait "FFMPEG Processing" '{"video_url": "..."}' 3600 10
+    
+    # Execute without waiting
+    n8n-cli execute-nowait "Background Task" '{"data": "value"}'
+    
+    # Wait for existing execution
+    n8n-cli wait-execution 185734 7200 5
 
     # Send webhook request
     n8n-cli webhook ffmpeg-result '{"message": "test"}'
@@ -1936,6 +2102,15 @@ main() {
             ;;
         "execute"|"run")
             execute_workflow "$@"
+            ;;
+        "execute-wait"|"exec-wait")
+            execute_workflow "$1" "$2" "true" "$3" "$4"
+            ;;
+        "execute-nowait"|"exec-nowait")
+            execute_workflow "$1" "$2" "false"
+            ;;
+        "wait-execution"|"wait-exec")
+            wait_for_execution "$@"
             ;;
             
         # Execution management
