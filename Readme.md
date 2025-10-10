@@ -1,4 +1,4 @@
-# n8n CLI Tool v2.1.0 �
+# n8n CLI Tool v2.1.0
 
 **Advanced Command-Line Interface for n8n Workflow Management**
 
