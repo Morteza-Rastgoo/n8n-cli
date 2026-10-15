@@ -32,8 +32,13 @@ load_env() {
     fi
 }
 
-# Load configuration
-load_env
+# Load configuration: ./.env, then ~/.config/n8n-cli/.env, then the script's own dir.
+_SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ -n "$N8N_CLI_ENV" ]]; then load_env "$N8N_CLI_ENV"
+elif [[ -f .env ]] && grep -q '^N8N_' .env; then load_env .env
+elif [[ -f "$HOME/.config/n8n-cli/.env" ]]; then load_env "$HOME/.config/n8n-cli/.env"
+else load_env "$_SCRIPT_DIR/.env"
+fi
 
 # Configuration with defaults
 N8N_URL="${N8N_URL:-https://n8n.com}"
@@ -494,7 +499,16 @@ execute_workflow() {
     fi
     
     log "Executing workflow: $identifier"
-    
+
+    # n8n's public API (v1) has no /workflows/{id}/execute endpoint; the call always 404s.
+    if [[ "$N8N_ALLOW_LEGACY_EXECUTE" != "true" ]]; then
+        error "n8n public API cannot start a workflow by ID. Use one of:"
+        echo "  n8n-cli retry <execution_id>        # re-run a past execution with its input" >&2
+        echo "  n8n-cli webhook <path> '<json>'     # workflow with a Webhook trigger" >&2
+        echo "  n8n-mcp tool n8n_test_workflow      # webhook/form/chat triggers" >&2
+        return 2
+    fi
+
     local data="${input_data:-{}}"
     local response=$(api_request "POST" "/workflows/$identifier/execute" "$data")
     local api_exit_code=$?
@@ -914,7 +928,7 @@ get_execution_details() {
     
     log "Fetching execution details: $execution_id"
     
-    local response=$(api_request "GET" "/executions/$execution_id")
+    local response=$(api_request "GET" "/executions/$execution_id?includeData=true")
     
     # Check if response contains valid execution data
     if ! echo "$response" | jq -e '.id' >/dev/null 2>&1; then
@@ -939,11 +953,16 @@ get_execution_details() {
             success "Execution completed successfully"
         elif echo "$response" | jq -e '.status == "error"' >/dev/null; then
             error "Execution failed"
-            # Show error details if available
-            if echo "$response" | jq -e '.data.resultData.error' >/dev/null 2>&1; then
-                echo "$response" | jq -r '.data.resultData.error.message // "No error message available"'
-            fi
-        else
+            echo "$response" | jq -r '"Last node: " + (.data.resultData.lastNodeExecuted // "N/A")'
+        fi
+        # Per-node trace: status, time, and error message for each node run.
+        if echo "$response" | jq -e '.data.resultData.runData' >/dev/null 2>&1; then
+            echo "--- nodes ---"
+            echo "$response" | jq -r '.data.resultData.runData | to_entries[] | .key as $n | .value[] |
+                if .error then "ERROR  \($n): \(.error.message // "?") \(.error.description // "" | tostring | .[0:200])"
+                else "ok     \($n) (\(.executionTime // 0) ms)" end'
+        fi
+        if echo "$response" | jq -e '.status == "running" or .status == "waiting" or .status == "new"' >/dev/null; then
             log "Execution is in progress"
         fi
     fi
@@ -1924,6 +1943,7 @@ EXECUTION COMMANDS:
     executions [workflow_id] [limit]  List executions with enhanced formatting
     execution <execution_id>          Get execution summary
     exec-full <execution_id>          Get full execution details (JSON)
+    retry <execution_id>              Re-run an execution with its original input
     execute <id|name> [data]          Execute workflow with waiting (default)
     execute-wait <id|name> [data] [timeout] [interval]  Execute and wait for completion
     execute-nowait <id|name> [data]   Execute without waiting
@@ -2122,6 +2142,10 @@ main() {
             ;;
         "exec-full")
             get_execution_details "$1" "true"
+            ;;
+        "retry")
+            [[ -z "$1" ]] && { error "Execution ID required"; exit 1; }
+            api_request "POST" "/executions/$1/retry" '{"loadWorkflow":true}' | jq '{id, status, workflowId, retryOf}'
             ;;
         "stop-execution"|"stop")
             stop_execution "$@"

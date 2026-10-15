@@ -142,6 +142,24 @@ API_MAX_RETRIES=3
 ./n8n-cli find "automation"
 ```
 
+## Running workflows and reading failures
+
+n8n's public API (v1) has **no endpoint that starts a workflow by ID**, so `execute` now
+stops with a hint instead of a silent 404. Use these instead:
+
+```bash
+n8n-cli retry <execution_id>          # re-run a past execution with its original input
+n8n-cli webhook <path> '{"k":"v"}'    # start a workflow that has a Webhook trigger
+n8n-cli execution <execution_id>      # per-node trace: ok/ERROR, time, error message
+```
+
+Config lookup order: `$N8N_CLI_ENV`, `./.env` (if it has `N8N_*` keys),
+`~/.config/n8n-cli/.env`, then the `.env` next to the script. So a symlink in
+`~/.local/bin` works from any directory.
+
+For agents, prefer the [n8n-mcp](https://github.com/czlonkowski/n8n-mcp) server
+(`n8n_executions` with `mode: "error"`, `n8n_update_partial_workflow`, `n8n_validate_workflow`).
+
 ## ⚙️ Environment Overrides
 ```bash
 # Override URL for different instance
